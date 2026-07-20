@@ -1,0 +1,8 @@
+bin/
+obj/
+*.user
+.vs/
+dlbackend/
+*.gguf
+*.safetensors
+*.ckpt
