@@ -81,7 +81,30 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
 
     public string Address => $"http://localhost:{Port}";
 
-    public override IEnumerable<string> SupportedFeatures => ["sdcpp"];
+    // 'controlnet' is advertised because SwarmUI's frontend sends "ControlNet Model = (None)" on every request,
+    // which flags it as requiring 'controlnet'. We accept that no-op case here and refuse only real ControlNet
+    // use in IsValidForThisBackend, so genuine ControlNet requests still route to a backend that implements it.
+    public override IEnumerable<string> SupportedFeatures => ["sdcpp", "controlnet"];
+
+    /// <inheritdoc/>
+    public override bool IsValidForThisBackend(T2IParamInput input)
+    {
+        foreach (T2IParamTypes.ControlNetParamHolder cn in T2IParamTypes.Controlnets)
+        {
+            if (cn is null)
+            {
+                continue;
+            }
+            bool realModel = input.TryGet(cn.Model, out T2IModel cnModel) && cnModel is not null && cnModel.Name.ToLowerFast() != "(none)";
+            bool hasImage = input.TryGet(cn.Image, out Image cnImg) && cnImg is not null;
+            if (realModel || hasImage)
+            {
+                input.RefusalReasons.Add("The stable-diffusion.cpp backend does not support ControlNet yet.");
+                return false;
+            }
+        }
+        return true;
+    }
 
     public override async Task Init()
     {
