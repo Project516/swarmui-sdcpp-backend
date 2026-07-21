@@ -28,6 +28,9 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         [ConfigComment("Optional manual path to an sd-server binary (or the folder containing it).\nLeave empty to auto-download the selected variant.")]
         public string BinaryPathOverride = "";
 
+        [ConfigComment("If checked, on each launch check GitHub for a newer stable-diffusion.cpp release and re-download if there is one.\nOff by default: releases are per-commit master builds, so leaving this off keeps a known-good binary. Ignored when a binary path override is set.\nIf the update check fails (eg no network), the existing cached binary is used.")]
+        public bool AutoUpdate = false;
+
         [ConfigComment("Place weights in system RAM and stream to VRAM on demand. Helps on low-VRAM / integrated GPUs.")]
         public bool OffloadToCpu = false;
 
@@ -79,7 +82,7 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         try
         {
             AddLoadStatus("Resolving stable-diffusion.cpp binary...");
-            BinDir = await SDCppBinaryManager.EnsureBinary(Settings.BackendVariant, Settings.BinaryPathOverride, AddLoadStatus);
+            BinDir = await SDCppBinaryManager.EnsureBinary(Settings.BackendVariant, Settings.BinaryPathOverride, Settings.AutoUpdate, AddLoadStatus);
             ServerBinaryPath = Path.Combine(BinDir, SDCppBinaryManager.ServerBinaryName);
             if (!File.Exists(ServerBinaryPath))
             {

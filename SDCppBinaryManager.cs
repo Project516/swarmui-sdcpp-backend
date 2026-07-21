@@ -25,7 +25,7 @@ public static class SDCppBinaryManager
     // instead of racing to write into the same cache dir, while different variants proceed in parallel.
     static readonly ConcurrentDictionary<string, SemaphoreSlim> Locks = new();
 
-    public static async Task<string> EnsureBinary(string variant, string overridePath, Action<string> log)
+    public static async Task<string> EnsureBinary(string variant, string overridePath, bool autoUpdate, Action<string> log)
     {
         log ??= _ => { };
         if (!string.IsNullOrWhiteSpace(overridePath))
@@ -39,7 +39,7 @@ public static class SDCppBinaryManager
         await sem.WaitAsync();
         try
         {
-            if (IsCacheValid(cacheDir))
+            if (IsCacheValid(cacheDir) && !(autoUpdate && await IsUpdateAvailable(cacheDir, log)))
             {
                 log($"Using cached stable-diffusion.cpp binary ({variant}) at {cacheDir}");
                 return cacheDir;
@@ -78,6 +78,37 @@ public static class SDCppBinaryManager
     static bool IsCacheValid(string cacheDir)
     {
         return File.Exists(Path.Combine(cacheDir, MarkerFileName)) && File.Exists(Path.Combine(cacheDir, ServerBinaryName));
+    }
+
+    /// <summary>For auto-update: true if the latest release tag differs from the cached one. On any failure
+    /// (eg no network, rate limit) returns false, so a failed update check never blocks using the cached binary.</summary>
+    static async Task<bool> IsUpdateAvailable(string cacheDir, Action<string> log)
+    {
+        string cachedTag;
+        try
+        {
+            cachedTag = File.ReadAllText(Path.Combine(cacheDir, MarkerFileName)).Trim();
+        }
+        catch (Exception)
+        {
+            return false;
+        }
+        try
+        {
+            (string latestTag, _) = await FetchLatestRelease();
+            if (latestTag == cachedTag)
+            {
+                log($"stable-diffusion.cpp is up to date ({cachedTag}).");
+                return false;
+            }
+            log($"stable-diffusion.cpp update available: {cachedTag} -> {latestTag}. Re-downloading...");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            log($"Auto-update check failed ({ex.Message}); keeping cached binary.");
+            return false;
+        }
     }
 
     static async Task DownloadAndInstall(string variant, string cacheDir, Action<string> log)

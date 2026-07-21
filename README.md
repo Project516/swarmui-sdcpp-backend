@@ -31,6 +31,7 @@ Then in SwarmUI open Server, then Backends, add a new backend of type "Stable-Di
 - **VAE tiling**: decodes the VAE in tiles to cut peak memory at high resolutions.
 - **Use mmap**, **Flash attention**, **Threads**, **Extra args**: the usual sd.cpp knobs.
 - **Binary path override**: point at your own `sd-server` build instead of downloading one.
+- **Auto-update**: off by default. When on, each launch checks GitHub for a newer stable-diffusion.cpp release and re-downloads if there is one. Releases are per-commit master builds, so leaving this off keeps a known-good binary. A failed check (no network, rate limit) falls back to the cached binary. Ignored when a binary path override is set.
 
 ## Using your own build
 
