@@ -50,7 +50,7 @@ Set `Binary path override` to your compiled `sd-server` (the file, or the folder
 
 ## Network use
 
-The only outbound connection this extension makes is to GitHub Releases, to download the `sd-server` binary for your platform on first use (or when you change the backend variant). Set a binary path override to avoid it entirely.
+The only outbound connection this extension makes is to GitHub Releases, to download the `sd-server` binary for your platform on first use (or when you change the backend variant or enable auto-update). Downloads are verified against the SHA-256 digest GitHub publishes for each asset. Set a binary path override to avoid the connection entirely.
 
 ## License
 

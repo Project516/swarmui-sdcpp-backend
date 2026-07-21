@@ -51,6 +51,9 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
 
         [ConfigComment("How many seconds to wait for a model to load before giving up.")]
         public int StartupTimeoutSeconds = 300;
+
+        [ConfigComment("How many minutes to allow a single generation before timing out.")]
+        public int GenerationTimeoutMinutes = 10;
     }
 
     public SDCppSelfStartSettings Settings => SettingsRaw as SDCppSelfStartSettings;
@@ -72,6 +75,9 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
 
     /// <summary>Set true just before an intentional kill so the monitor doesn't flag it as a crash.</summary>
     public volatile bool ExpectedExit;
+
+    /// <summary>Serializes model load/stop/launch so concurrent LoadModel calls can't orphan a process.</summary>
+    public readonly SemaphoreSlim LoadLock = new(1, 1);
 
     public string Address => $"http://localhost:{Port}";
 
@@ -104,7 +110,15 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
     public override async Task Shutdown()
     {
         Status = BackendStatus.DISABLED;
-        await StopProcess();
+        await LoadLock.WaitAsync();
+        try
+        {
+            await StopProcess();
+        }
+        finally
+        {
+            LoadLock.Release();
+        }
         CurrentModelName = null;
         CurrentModelPath = null;
     }
@@ -113,20 +127,28 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
     public override async Task<bool> LoadModel(T2IModel model, T2IParamInput input)
     {
         string wanted = model.RawFilePath;
-        if (RunningProcess is not null && !RunningProcess.HasExited && CurrentModelPath == wanted && Status == BackendStatus.RUNNING)
+        await LoadLock.WaitAsync();
+        try
         {
-            CurrentModelName = model.Name;
-            return true;
+            if (RunningProcess is not null && !RunningProcess.HasExited && CurrentModelPath == wanted && Status == BackendStatus.RUNNING)
+            {
+                CurrentModelName = model.Name;
+                return true;
+            }
+            await StopProcess();
+            bool ok = await LaunchServer(wanted);
+            if (ok)
+            {
+                CurrentModelName = model.Name;
+                return true;
+            }
+            CurrentModelName = null;
+            return false;
         }
-        await StopProcess();
-        bool ok = await LaunchServer(wanted);
-        if (ok)
+        finally
         {
-            CurrentModelName = model.Name;
-            return true;
+            LoadLock.Release();
         }
-        CurrentModelName = null;
-        return false;
     }
 
     /// <summary>Launches sd-server for a given model file and waits until it is serving. Returns true on success.</summary>
@@ -144,12 +166,15 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         ProcessStartInfo start = new()
         {
             FileName = ServerBinaryPath,
-            Arguments = BuildArgs(modelPath, port),
             WorkingDirectory = BinDir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
             UseShellExecute = false
         };
+        foreach (string arg in BuildArgs(modelPath, port))
+        {
+            start.ArgumentList.Add(arg);
+        }
         // Stability Matrix and similar launchers pollute the environment with Python paths that can confuse a native binary.
         PythonLaunchHelper.CleanEnvironmentOfPythonMess(start, "(SDcpp launch) ");
         // sd-server's shared libraries (libggml-*, libstable-diffusion, ...) sit alongside the binary.
@@ -200,14 +225,15 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         return Status == BackendStatus.RUNNING;
     }
 
-    /// <summary>Builds the sd-server argument string (forwarded through the wrapper script).</summary>
-    public string BuildArgs(string modelPath, int port)
+    /// <summary>Builds the sd-server argument list (passed via ProcessStartInfo.ArgumentList, which handles all
+    /// escaping, so paths/values with spaces or quotes are safe and cannot inject extra flags).</summary>
+    public List<string> BuildArgs(string modelPath, int port)
     {
-        List<string> args = ["-m", Quote(modelPath)];
+        List<string> args = ["-m", modelPath];
         if (!string.IsNullOrWhiteSpace(Settings.Device))
         {
             args.Add("--backend");
-            args.Add(Quote(Settings.Device));
+            args.Add(Settings.Device.Trim());
         }
         if (Settings.OffloadToCpu) { args.Add("--offload-to-cpu"); }
         if (Settings.VaeTiling) { args.Add("--vae-tiling"); }
@@ -220,11 +246,13 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         args.Add($"{port}");
         args.Add("-v");
         string extra = Settings.ExtraArgs?.Trim();
-        string built = string.Join(' ', args);
-        return string.IsNullOrEmpty(extra) ? built : $"{built} {extra}";
+        if (!string.IsNullOrEmpty(extra))
+        {
+            // Advanced escape-hatch field: split on whitespace into individual arguments.
+            args.AddRange(extra.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        }
+        return args;
     }
-
-    static string Quote(string s) => s.Contains(' ') ? $"\"{s}\"" : s;
 
     /// <summary>Health-checks the server; on success loads sampler/scheduler lists and flips status to RUNNING.</summary>
     public async Task InitInternal()
@@ -249,6 +277,10 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
 
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
+        if (RunningProcess is null || RunningProcess.HasExited)
+        {
+            throw new SwarmReadableErrorException("The stable-diffusion.cpp backend has no running sd-server (no model loaded yet). Select a model so the backend can start one.");
+        }
         user_input.ProcessPromptEmbeds(x => x.BeforeLast('.'));
         JObject toSend = new()
         {
@@ -271,6 +303,12 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         {
             toSend["scheduler"] = scheduler;
         }
+        // SwarmUI's CLIP Stop At Layer counts layers from the end (negative, eg -1, -2); sd-server's clip_skip
+        // uses the A1111 positive convention (1 = skip none, 2 = skip one), so negate.
+        if (user_input.TryGet(T2IParamTypes.ClipStopAtLayer, out int clipStop))
+        {
+            toSend["clip_skip"] = -clipStop;
+        }
         string route = "txt2img";
         if (user_input.TryGet(T2IParamTypes.InitImage, out Image initImg))
         {
@@ -280,7 +318,7 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         }
         // ponytail: LoRA not wired yet. The A1111 endpoint's LoRA handling in sd-server differs from A1111
         // (structured 'lora' array, not '<lora:..>' prompt syntax). Add when LoRA support is needed.
-        JObject result = await SendPost<JObject>(route, toSend);
+        JObject result = await SendPost<JObject>(route, toSend, Math.Max(1, Settings.GenerationTimeoutMinutes) * 60);
         JToken images = result["images"];
         if (images is null)
         {
@@ -289,14 +327,16 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         return [.. images.Select(i => ImageFile.FromBase64((string)i, MediaType.ImagePng) as Image)];
     }
 
-    public async Task<JType> SendGet<JType>(string url) where JType : class
+    public async Task<JType> SendGet<JType>(string url, int timeoutSeconds = 15) where JType : class
     {
-        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.GetAsync($"{Address}/sdapi/v1/{url}"));
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(timeoutSeconds));
+        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.GetAsync($"{Address}/sdapi/v1/{url}", cts.Token));
     }
 
-    public async Task<JType> SendPost<JType>(string url, JObject payload) where JType : class
+    public async Task<JType> SendPost<JType>(string url, JObject payload, int timeoutSeconds) where JType : class
     {
-        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.PostAsync($"{Address}/sdapi/v1/{url}", Utilities.JSONContent(payload)));
+        using CancellationTokenSource cts = new(TimeSpan.FromSeconds(timeoutSeconds));
+        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.PostAsync($"{Address}/sdapi/v1/{url}", Utilities.JSONContent(payload), cts.Token));
     }
 
     /// <summary>Pumps stdout/stderr to logs and marks the backend ERRORED if the process dies unexpectedly.</summary>
@@ -348,6 +388,7 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         Process proc = RunningProcess;
         RunningProcess = null;
         CurrentModelPath = null;
+        Port = 0;
         if (proc is null || proc.HasExited)
         {
             return;

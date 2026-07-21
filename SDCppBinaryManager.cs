@@ -39,12 +39,27 @@ public static class SDCppBinaryManager
         await sem.WaitAsync();
         try
         {
-            if (IsCacheValid(cacheDir) && !(autoUpdate && await IsUpdateAvailable(cacheDir, log)))
+            bool hadValidCache = IsCacheValid(cacheDir);
+            if (hadValidCache && !(autoUpdate && await IsUpdateAvailable(cacheDir, log)))
             {
                 log($"Using cached stable-diffusion.cpp binary ({variant}) at {cacheDir}");
                 return cacheDir;
             }
-            await DownloadAndInstall(variant, cacheDir, log);
+            try
+            {
+                await DownloadAndInstall(variant, cacheDir, log);
+            }
+            catch (Exception ex)
+            {
+                // If an update/re-download fails but a valid cache is still in place, keep using it rather than
+                // breaking the backend over a network hiccup. Only a first-time install with no cache is fatal.
+                if (hadValidCache && IsCacheValid(cacheDir))
+                {
+                    log($"Update/download failed ({ex.Message}); keeping the existing cached binary.");
+                    return cacheDir;
+                }
+                throw;
+            }
             if (!IsCacheValid(cacheDir))
             {
                 throw new Exception($"'{ServerBinaryName}' still missing from {cacheDir} after extraction - the release asset layout may have changed upstream.");
@@ -125,32 +140,59 @@ public static class SDCppBinaryManager
         {
             throw new Exception($"Found the main CUDA binary but not the required 'cudart-sd-bin-win-cu12-x64' runtime asset in release '{tag}'. Both are needed for Windows CUDA support.");
         }
-        foreach (JToken asset in toDownload)
+        // Build into a staging dir and swap in atomically. A failed or partial download never touches the live
+        // cache, so there's no mismatched exe+runtime and any existing cached binary stays usable as a fallback.
+        string staging = cacheDir + ".staging";
+        if (Directory.Exists(staging))
         {
-            string name = (string)asset["name"];
-            string url = (string)asset["browser_download_url"];
-            string zipPath = Path.Combine(cacheDir, name);
-            try
+            Directory.Delete(staging, true);
+        }
+        Directory.CreateDirectory(staging);
+        try
+        {
+            foreach (JToken asset in toDownload)
             {
-                log($"Downloading {name}...");
-                await Utilities.DownloadFile(url, zipPath, (_, _, _) => { });
-                log($"Extracting {name}...");
-                ZipFile.ExtractToDirectory(zipPath, cacheDir, overwriteFiles: true);
+                string name = (string)asset["name"];
+                string url = (string)asset["browser_download_url"];
+                string sha = ((string)asset["digest"])?.Trim();
+                sha = sha is not null && sha.StartsWith("sha256:", StringComparison.OrdinalIgnoreCase) ? sha["sha256:".Length..] : null;
+                string zipPath = Path.Combine(staging, name);
+                try
+                {
+                    log($"Downloading {name}{(sha is null ? "" : " (verifying sha256)")}...");
+                    await Utilities.DownloadFile(url, zipPath, (_, _, _) => { }, verifyHash: sha);
+                    log($"Extracting {name}...");
+                    ZipFile.ExtractToDirectory(zipPath, staging, overwriteFiles: true);
+                }
+                finally
+                {
+                    try { File.Delete(zipPath); }
+                    catch { /* best-effort cleanup, not fatal */ }
+                }
             }
-            catch (Exception ex)
+            if (!File.Exists(Path.Combine(staging, ServerBinaryName)))
             {
-                throw new Exception($"Failed to download/extract stable-diffusion.cpp asset '{name}': {ex.Message}", ex);
+                throw new Exception($"'{ServerBinaryName}' missing after extraction - the release asset layout may have changed upstream.");
             }
-            finally
+            SetExecutable(staging);
+            // Marker written last, inside staging, so it only becomes visible once the whole install succeeded.
+            File.WriteAllText(Path.Combine(staging, MarkerFileName), tag);
+            // Swap into place. The old cache is untouched until this point.
+            if (Directory.Exists(cacheDir))
             {
-                try { File.Delete(zipPath); }
-                catch { /* best-effort cleanup, not fatal */ }
+                Directory.Delete(cacheDir, true);
+            }
+            Directory.Move(staging, cacheDir);
+            log($"Installed stable-diffusion.cpp {tag} ({variant}) to {cacheDir}");
+        }
+        finally
+        {
+            if (Directory.Exists(staging))
+            {
+                try { Directory.Delete(staging, true); }
+                catch { /* best-effort cleanup */ }
             }
         }
-        SetExecutable(cacheDir);
-        // Only write the marker once every asset extracted cleanly, so a failed/partial run never leaves a false-cached state.
-        File.WriteAllText(Path.Combine(cacheDir, MarkerFileName), tag);
-        log($"Installed stable-diffusion.cpp {tag} ({variant}) to {cacheDir}");
     }
 
     static async Task<(string tag, JArray assets)> FetchLatestRelease()
