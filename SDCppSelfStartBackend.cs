@@ -411,6 +411,7 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         Process proc = RunningProcess;
         RunningProcess = null;
         CurrentModelPath = null;
+        int oldPort = Port;
         Port = 0;
         if (proc is null || proc.HasExited)
         {
@@ -419,7 +420,7 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         ExpectedExit = true;
         try
         {
-            Logs.Info($"[SDcpp] Stopping sd-server (port {Port}) process #{proc.Id}...");
+            Logs.Info($"[SDcpp] Stopping sd-server (port {oldPort}) process #{proc.Id}...");
             Utilities.KillProcess(proc, 10);
         }
         catch (Exception ex)
