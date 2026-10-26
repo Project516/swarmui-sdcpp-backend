@@ -10,8 +10,7 @@ namespace Project516.SDCppBackend;
 
 /// <summary>Downloads and caches prebuilt stable-diffusion.cpp binaries from GitHub releases, so the backend
 /// works on a fresh machine with no build toolchain. Each variant gets its own cache dir under
-/// <c>{DataDir}/dlbackend/sdcpp/{variant}/</c>; once a release is extracted there it is reused forever
-/// (no auto-update, to avoid surprise churn - delete the dir or set BinaryPathOverride to force a change).</summary>
+/// <c>{DataDir}/dlbackend/sdcpp/{variant}/</c> and is reused until auto-update finds a newer release.</summary>
 public static class SDCppBinaryManager
 {
     public const string GithubApiUrl = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest";

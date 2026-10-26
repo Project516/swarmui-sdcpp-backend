@@ -1,8 +1,8 @@
 # SwarmUI stable-diffusion.cpp backend
 
-A [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI) extension that generates images through [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp). The point is Vulkan: it runs text-to-image on GPUs that SwarmUI's Python backends can only use as CPU, including integrated Radeon and Intel graphics. It also supports CPU, CUDA, and ROCm builds.
+A [SwarmUI](https://github.com/mcmonkeyprojects/SwarmUI) extension that generates images through [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp). The point is Vulkan: it runs image generation on GPUs that SwarmUI's Python backends can only use as CPU, including integrated Radeon and Intel graphics. It also supports CPU, CUDA, and ROCm builds.
 
-It works by running stable-diffusion.cpp's `sd-server` as a managed local process and talking to it over the Automatic1111-compatible HTTP API, the same way SwarmUI's built-in AutoWebUI backend works.
+It works by running stable-diffusion.cpp's `sd-server` as a managed local process and talking to it over its native job API (`/sdcpp/v1`), which provides previews and cancellation.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ Then in SwarmUI open Server, then Backends, add a new backend of type "Stable-Di
 
 - **Backend variant**: which prebuilt binary to download. `vulkan` (default), `cpu`, `cuda`, or `rocm`. Vulkan is the widest choice and covers most GPUs including integrated ones.
 - **Device**: passed to `sd-server --backend`. Leave it empty to let sd.cpp pick the first device. Set `Vulkan0`, `CUDA0`, `CPU`, or a per-module string like `diffusion=Vulkan0,vae=CPU` if you want control.
-- **Offload to CPU**: keeps weights in system RAM and moves them to VRAM on demand. Useful on integrated GPUs that share system memory.
+- **Offload to CPU**: keeps weights in system RAM and moves them to VRAM on demand. Leave it off initially. Some models on Vulkan fail with offload enabled even when automatic placement works.
 - **VAE tiling**: decodes the VAE in tiles to cut peak memory at high resolutions.
 - **Use mmap**, **Flash attention**, **Threads**, **Extra args**: the usual sd.cpp knobs.
 - **Binary path override**: point at your own `sd-server` build instead of downloading one.
@@ -39,14 +39,50 @@ Set `Binary path override` to your compiled `sd-server` (the file, or the folder
 
 ## How models load
 
-`sd-server` loads one model at launch and has no API to swap it. So this backend starts a fresh `sd-server` process for whatever model SwarmUI asks for, and restarts it when you switch models. The model list comes from SwarmUI's own model manager, not the server. Most generations reuse the same model, so restarts are infrequent, but the first use of a new model has a load delay.
+`sd-server` holds one set of model files per process. This backend starts a process with explicit file paths for whatever SwarmUI asks for and restarts it when the set changes: a different model, VAE, or text encoder. Most generations reuse the same set, so restarts are infrequent, but the first use of a new set has a load delay. The model list comes from SwarmUI's own model manager.
+
+Explicit paths mean the backend does not depend on folder names. Stability Matrix names (`StableDiffusion`, `DiffusionModels`, `TextEncoders`) and SwarmUI's own names both work, as does a symlinked model folder. sd-server's `--model-dir` loader would need specific folder names and rejects symlinks that point outside its root.
+
+### Multi-file models
+
+Put the diffusion model in SwarmUI's `diffusion_models` folder, then pick the side models in the Advanced Model Addons group:
+
+- Z-Image and FLUX.2 klein: set **Qwen Model** to the Qwen3 text encoder, and **VAE** (or leave it on automatic).
+- FLUX.2 dev: set **Mistral Model**.
+- FLUX.1 and SD3: set **CLIP-L Model**, **CLIP-G Model** (SD3 only) and **T5-XXL Model**.
+
+Models in the regular checkpoint folder load as a single file, and can still use a separate VAE. GGUF and safetensors files both work. If a model needs a text encoder you did not set, sd-server fails to load and the error shows its last output lines.
+
+When the VAE is left on automatic, the backend picks the first installed VAE whose architecture matches the model, the same way SwarmUI's ComfyUI backend does.
+
+## LoRA
+
+LoRAs picked in SwarmUI (or written as `<lora:name:weight>` in the prompt) are passed to sd-server with their weights. sd-server reads LoRAs from one folder, so the backend uses the first folder in SwarmUI's LoRA folder setting. A LoRA in another folder makes the backend refuse the request. The separate text-encoder LoRA weight is ignored.
+
+## Refine / Upscale (hires fix)
+
+The Refine / Upscale group maps to sd-server's hires fix. **Refiner Upscale** is the scale, **Refiner Control Percentage** is the denoising strength of the second pass, and the second pass runs that fraction of the steps, as in SwarmUI's ComfyUI backend. For example, 20 steps with 0.4 control run 8 steps in the second pass. **Refiner Steps**, if set, replaces the step count before that fraction is taken.
+
+**Refiner Upscale Method** supports the pixel methods (Lanczos, or Nearest for nearest-exact), the latent methods, and ESRGAN models. ESRGAN files are read from the `ESRGAN` folder of your model root and appear in that dropdown as `Model: <file>`. Latent models, PiD models, step-swap refiners, and a separate refiner model are not supported, and the backend refuses those requests.
+
+Enable **VAE tiling** for hires generation on GPUs with limited memory, especially with LoRAs. A Vulkan test of SD 1.5 with a LoRA and 1.5× pixel upscale failed during VAE encoding without tiling and completed with tiling enabled. Tiling reduces peak memory but does not guarantee that every resolution fits.
+
+The backend advertises the `refiners` and `comfyui` features, because SwarmUI flags the upscale-method parameter as ComfyUI-only. Other ComfyUI-only parameters are ignored by this backend.
+
+## Other features
+
+- Image to image uses the init image and Init Image Creativity as the denoising strength.
+- Live step previews appear during generation. Turn them off with the No Previews parameter.
+- Cancelling a generation, or a model load in progress, stops it in sd-server.
+- If sd-server crashes (for example, out of memory), the next request starts a new process.
 
 ## Limitations
 
-- Single-file checkpoints (SD1.x, SD2.x, SDXL as `.safetensors`, `.ckpt`, or `.gguf`) are the tested path. Multi-file setups (separate diffusion/VAE/text-encoder files for Flux or SD3) are not wired up yet.
-- No live step previews yet. You get the finished image.
-- LoRA is not passed through yet.
-- Vulkan performance and stability vary by driver and model. On some hardware and models it is slower than a good CPU run, and large models can exhaust shared VRAM. Benchmark before assuming it is faster, and use offload/tiling for big models.
+- Inpainting masks, ControlNet, step-swap refiners, and variation seeds are not supported. Requests that use them go to another backend.
+- Embeddings are not passed through.
+- LoRAs must be in the first LoRA folder.
+- Batch Size is limited to 8, sd-server's maximum.
+- Vulkan performance and stability vary by driver and model. On some hardware and models it is slower than a good CPU run, and large models can exhaust shared VRAM. Benchmark before assuming it is faster. Enable VAE tiling to reduce peak memory and test offload separately.
 
 ## Network use
 
