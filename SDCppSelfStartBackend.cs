@@ -2,19 +2,20 @@ using FreneticUtilities.FreneticDataSyntax;
 using FreneticUtilities.FreneticExtensions;
 using Newtonsoft.Json.Linq;
 using SwarmUI.Backends;
+using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
 using SwarmUI.Media;
 using SwarmUI.Text2Image;
 using SwarmUI.Utils;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
-using System.Text;
+using System.Net.Http;
 
 namespace Project516.SDCppBackend;
 
-/// <summary>Backend that runs stable-diffusion.cpp's <c>sd-server</c> as a managed local process.
-/// sd-server loads exactly one model per launch (there is no runtime model-swap API), so switching
-/// models is done by restarting the process with a new <c>-m</c>.</summary>
+/// <summary>Runs stable-diffusion.cpp's <c>sd-server</c> as a managed local process. A server holds one set of
+/// model files, so a different set (model, VAE, or text encoders) means a restart with new file paths.</summary>
 public class SDCppSelfStartBackend : AbstractT2IBackend
 {
     public class SDCppSelfStartSettings : AutoConfiguration
@@ -56,51 +57,158 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         public int GenerationTimeoutMinutes = 10;
     }
 
+    /// <summary>The files one sd-server process is launched with. Null fields are not passed.</summary>
+    public record ModelFiles(string Checkpoint, string DiffusionModel, string Vae, string ClipL, string ClipG, string T5xxl, string Llm)
+    {
+        public IEnumerable<(string Flag, string Path)> Slots()
+        {
+            (string Flag, string Path)[] all = [("-m", Checkpoint), ("--diffusion-model", DiffusionModel), ("--vae", Vae), ("--clip_l", ClipL), ("--clip_g", ClipG), ("--t5xxl", T5xxl), ("--llm", Llm)];
+            return all.Where(s => s.Path is not null);
+        }
+
+        public IEnumerable<string> Args() => Slots().SelectMany(s => new[] { s.Flag, s.Path });
+
+        /// <summary>Files for a Swarm model plus the side models (VAE, text encoders) chosen in the request.</summary>
+        public static ModelFiles For(T2IModel model, T2IParamInput input)
+        {
+            string pick(params T2IRegisteredParam<T2IModel>[] options)
+            {
+                foreach (T2IRegisteredParam<T2IModel> option in options)
+                {
+                    if (input is not null && input.TryGet(option, out T2IModel chosen) && chosen?.RawFilePath is not null)
+                    {
+                        return chosen.RawFilePath;
+                    }
+                }
+                return null;
+            }
+            bool standalone = model.IsDiffusionModelsFormat;
+            return new(standalone ? null : model.RawFilePath, standalone ? model.RawFilePath : null,
+                pick(T2IParamTypes.VAE) ?? (standalone ? AutoVae(model) : null),
+                pick(T2IParamTypes.ClipLModel), pick(T2IParamTypes.ClipGModel), pick(T2IParamTypes.T5XXLModel),
+                pick(T2IParamTypes.QwenModel, T2IParamTypes.MistralModel));
+        }
+
+        /// <summary>First installed VAE of the model's latent family, as SwarmUI's own Automatic VAE does.</summary>
+        static string AutoVae(T2IModel model)
+        {
+            string family = model.ModelClass?.CompatClass?.VaeFamily?.CompatClassID;
+            return family is null ? null : Program.T2IModelSets["VAE"].Models.Values
+                .FirstOrDefault(v => v.ModelClass?.CompatClass?.ID == family && v.ModelClass.ID.EndsWith("/vae"))?.RawFilePath;
+        }
+    }
+
     public SDCppSelfStartSettings Settings => SettingsRaw as SDCppSelfStartSettings;
 
-    /// <summary>The currently running sd-server process, or null.</summary>
+    /// <summary>The running sd-server process, or null.</summary>
     public volatile Process RunningProcess;
 
-    /// <summary>Port the current process is listening on.</summary>
     public volatile int Port;
 
-    /// <summary>The model file path currently launched (matches the process's '-m'), or null.</summary>
-    public volatile string CurrentModelPath;
+    /// <summary>What the running process was launched with, or null.</summary>
+    public volatile ModelFiles LoadedFiles;
 
     /// <summary>Directory containing sd-server and its shared libraries.</summary>
     public string BinDir;
 
-    /// <summary>Absolute path to the sd-server executable.</summary>
     public string ServerBinaryPath;
 
-    /// <summary>Set true just before an intentional kill so the monitor doesn't flag it as a crash.</summary>
-    public volatile bool ExpectedExit;
-
-    /// <summary>Serializes model load/stop/launch so concurrent LoadModel calls can't orphan a process.</summary>
+    /// <summary>Serializes model load/stop/launch so concurrent calls can't orphan a process.</summary>
     public readonly SemaphoreSlim LoadLock = new(1, 1);
+
+    /// <summary>Most recent server output lines, shown when the server fails.</summary>
+    public readonly ConcurrentQueue<string> LogTail = new();
 
     public string Address => $"http://localhost:{Port}";
 
-    // 'controlnet' is advertised because SwarmUI's frontend sends "ControlNet Model = (None)" on every request,
-    // which flags it as requiring 'controlnet'. We accept that no-op case here and refuse only real ControlNet
-    // use in IsValidForThisBackend, so genuine ControlNet requests still route to a backend that implements it.
-    public override IEnumerable<string> SupportedFeatures => ["sdcpp", "controlnet"];
+    // 'controlnet' is advertised because SwarmUI's frontend sends "ControlNet Model = (None)" on every request.
+    // Real ControlNet use is refused in IsValidForThisBackend. 'refiners' and 'comfyui' are needed for the
+    // Refine / Upscale group, whose "Refiner Upscale Method" parameter is flagged 'comfyui'.
+    public override IEnumerable<string> SupportedFeatures => ["sdcpp", "controlnet", "refiners", "comfyui"];
+
+    /// <summary>sd-server's batch_count limit.</summary>
+    public const int MaxBatchSize = 8;
+
+    /// <summary>Path of a LoRA relative to the folder given to sd-server, or null if sd-server cannot see it.</summary>
+    public static string LoraPath(string name)
+    {
+        T2IModelHandler loras = Program.T2IModelSets["LoRA"];
+        string dir = loras.FolderPaths.FirstOrDefault();
+        if (dir is null || (!loras.Models.TryGetValue(name + ".safetensors", out T2IModel lora) && !loras.Models.TryGetValue(name, out lora)))
+        {
+            return null;
+        }
+        string relative = Path.GetRelativePath(dir, lora.RawFilePath);
+        return relative.StartsWith(".." + Path.DirectorySeparatorChar) || Path.IsPathRooted(relative) ? null : relative.Replace('\\', '/');
+    }
+
+    /// <summary>True when the Refine / Upscale group is on with a non-zero control, so a hires pass should run.</summary>
+    public static bool Refining(T2IParamInput input, out double control) => input.TryGet(T2IParamTypes.RefinerControl, out control) && control > 0;
+
+    /// <summary>Maps a "Refiner Upscale Method" value to an sd-server hires upscaler name, or null if unsupported.</summary>
+    public static string HiresUpscaler(string method)
+    {
+        if (method.StartsWith("pixel-"))
+        {
+            return method == "pixel-nearest-exact" ? "Nearest" : "Lanczos";
+        }
+        if (method.StartsWith("latent-"))
+        {
+            return method switch { "latent-nearest-exact" => "Latent (nearest-exact)", "latent-bicubic" => "Latent (bicubic)", _ => "Latent" };
+        }
+        return method.StartsWith("model-") ? Path.GetFileNameWithoutExtension(method["model-".Length..]) : null;
+    }
 
     /// <inheritdoc/>
     public override bool IsValidForThisBackend(T2IParamInput input)
     {
+        bool refuse(string reason)
+        {
+            input.RefusalReasons.Add($"The stable-diffusion.cpp backend does not support {reason}.");
+            return false;
+        }
         foreach (T2IParamTypes.ControlNetParamHolder cn in T2IParamTypes.Controlnets)
         {
-            if (cn is null)
+            bool realModel = cn is not null && input.TryGet(cn.Model, out T2IModel cnModel) && cnModel is not null && cnModel.Name.ToLowerFast() != "(none)";
+            if (realModel || (cn is not null && input.TryGet(cn.Image, out Image cnImg) && cnImg is not null))
             {
-                continue;
+                return refuse("ControlNet yet");
             }
-            bool realModel = input.TryGet(cn.Model, out T2IModel cnModel) && cnModel is not null && cnModel.Name.ToLowerFast() != "(none)";
-            bool hasImage = input.TryGet(cn.Image, out Image cnImg) && cnImg is not null;
-            if (realModel || hasImage)
+        }
+        if (input.Get(T2IParamTypes.BatchSize, 1) > MaxBatchSize)
+        {
+            return refuse($"a batch size above {MaxBatchSize}");
+        }
+        if (input.TryGet(T2IParamTypes.MaskImage, out Image _))
+        {
+            return refuse("masks or inpainting");
+        }
+        if (input.Get(T2IParamTypes.VariationSeedStrength, 0.0) > 0)
+        {
+            return refuse("variation seeds");
+        }
+        if (input.TryGet(T2IParamTypes.Loras, out List<string> loras) && loras.FirstOrDefault(l => LoraPath(l) is null) is string badLora)
+        {
+            return refuse($"LoRA '{badLora}' (it must be in the first LoRA folder)");
+        }
+        if (Refining(input, out _))
+        {
+            if (input.Get(T2IParamTypes.RefinerMethod, "PostApply") != "PostApply")
             {
-                input.RefusalReasons.Add("The stable-diffusion.cpp backend does not support ControlNet yet.");
-                return false;
+                return refuse("step-swap refiners");
+            }
+            if (input.TryGet(T2IParamTypes.RefinerModel, out T2IModel refiner) && refiner.Name != input.Get(T2IParamTypes.Model).Name)
+            {
+                return refuse("a separate refiner model");
+            }
+            if (input.TryGet(T2IParamTypes.InitImage, out Image _))
+            {
+                return refuse("refining an init image");
+            }
+            string method = input.Get(ComfyUIBackendExtension.RefinerUpscaleMethod, "pixel-lanczos");
+            if (HiresUpscaler(method) is null)
+            {
+                return refuse($"the upscale method '{method}'");
             }
         }
         return true;
@@ -117,9 +225,9 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
             {
                 throw new Exception($"sd-server not found at {ServerBinaryPath}");
             }
+            SDCppBackendExtension.ListUpscalers();
             AddLoadStatus($"Binary ready at {BinDir}. Backend is ready to load a model on demand.");
-            // sd-server needs a model to launch, so we don't start a process here. We report RUNNING to mean
-            // "ready to accept a model"; the handler then calls LoadModel, which launches the process.
+            // sd-server needs model files to launch, so RUNNING here means "ready to load one on demand".
             Status = BackendStatus.RUNNING;
         }
         catch (Exception ex)
@@ -136,37 +244,37 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         await LoadLock.WaitAsync();
         try
         {
-            await StopProcess();
+            StopProcess();
+            CurrentModelName = null;
         }
         finally
         {
             LoadLock.Release();
         }
-        CurrentModelName = null;
-        CurrentModelPath = null;
     }
 
-    /// <summary>Loads a model by (re)launching sd-server with that model. Returns true on success.</summary>
     public override async Task<bool> LoadModel(T2IModel model, T2IParamInput input)
     {
-        string wanted = model.RawFilePath;
+        await EnsureLoaded(model, input);
+        return true;
+    }
+
+    /// <summary>Makes sure the running server holds the files this request needs, restarting it if not.</summary>
+    public async Task EnsureLoaded(T2IModel model, T2IParamInput input)
+    {
+        ModelFiles wanted = ModelFiles.For(model, input);
         await LoadLock.WaitAsync();
         try
         {
-            if (RunningProcess is not null && !RunningProcess.HasExited && CurrentModelPath == wanted && Status == BackendStatus.RUNNING)
+            if (RunningProcess is { HasExited: false } && LoadedFiles == wanted)
             {
                 CurrentModelName = model.Name;
-                return true;
+                return;
             }
-            await StopProcess();
-            bool ok = await LaunchServer(wanted);
-            if (ok)
-            {
-                CurrentModelName = model.Name;
-                return true;
-            }
+            StopProcess();
             CurrentModelName = null;
-            return false;
+            await LaunchServer(wanted, input.InterruptToken);
+            CurrentModelName = model.Name;
         }
         finally
         {
@@ -174,34 +282,37 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         }
     }
 
-    /// <summary>Launches sd-server for a given model file and waits until it is serving. Returns true on success.</summary>
-    public async Task<bool> LaunchServer(string modelPath)
+    /// <summary>Starts sd-server with the given files and waits until it answers. Throws with the server's last output on failure,
+    /// or stops the process and throws a TaskCanceledException if <paramref name="interrupt"/> fires.</summary>
+    public async Task LaunchServer(ModelFiles files, CancellationToken interrupt)
     {
-        if (!File.Exists(modelPath))
+        foreach ((_, string path) in files.Slots())
         {
-            Logs.Error($"[SDcpp] Model file does not exist: {modelPath}");
-            return false;
+            if (!File.Exists(path))
+            {
+                throw new SwarmReadableErrorException($"Model file does not exist: {path}");
+            }
         }
         int port = NetworkBackendUtils.GetNextPort();
-        Port = port;
-        CurrentModelPath = modelPath;
-        ExpectedExit = false;
         ProcessStartInfo start = new()
         {
             FileName = ServerBinaryPath,
             WorkingDirectory = BinDir,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
             UseShellExecute = false
         };
-        foreach (string arg in BuildArgs(modelPath, port))
+        // ArgumentList handles all escaping, so paths with spaces or quotes cannot inject extra flags.
+        foreach (string arg in BuildArgs(files, port))
         {
             start.ArgumentList.Add(arg);
         }
         // Stability Matrix and similar launchers pollute the environment with Python paths that can confuse a native binary.
         PythonLaunchHelper.CleanEnvironmentOfPythonMess(start, "(SDcpp launch) ");
         // sd-server's shared libraries (libggml-*, libstable-diffusion, ...) sit alongside the binary.
-        if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+        if (OperatingSystem.IsWindows())
         {
             start.Environment.TryGetValue("PATH", out string existingPath);
             start.Environment["PATH"] = $"{BinDir};{existingPath}";
@@ -212,221 +323,363 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
             start.Environment["LD_LIBRARY_PATH"] = $"{BinDir}:{existingLibPath}";
         }
         Status = BackendStatus.LOADING;
-        Logs.Init($"[SDcpp] Launching sd-server on port {port} for model '{modelPath}'...");
-        AddLoadStatus($"Launching sd-server on port {port}...");
-        Process proc = new() { StartInfo = start };
-        RunningProcess = proc;
-        proc.Start();
-        MonitorProcess(proc);
-        long deadline = Environment.TickCount64 + Settings.StartupTimeoutSeconds * 1000L;
-        while (Status == BackendStatus.LOADING)
+        try
         {
-            if (proc.HasExited)
+            Logs.Init($"[SDcpp] Launching sd-server on port {port} with {files.Args().JoinString(" ")}");
+            AddLoadStatus($"Launching sd-server on port {port}...");
+            LogTail.Clear();
+            Process proc = new() { StartInfo = start };
+            proc.OutputDataReceived += (_, e) => LogLine(e.Data);
+            proc.ErrorDataReceived += (_, e) => LogLine(e.Data);
+            proc.Start();
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+            RunningProcess = proc;
+            Port = port;
+            LoadedFiles = files;
+            WatchForCrash(proc);
+            long deadline = Environment.TickCount64 + Settings.StartupTimeoutSeconds * 1000L;
+            while (!await IsServing())
             {
-                Logs.Error($"[SDcpp] sd-server exited during startup (code {proc.ExitCode}).");
-                Status = BackendStatus.ERRORED;
-                return false;
-            }
-            if (Environment.TickCount64 > deadline)
-            {
-                Logs.Error($"[SDcpp] Timed out after {Settings.StartupTimeoutSeconds}s waiting for sd-server to load model.");
-                AddLoadStatus("Timed out waiting for server.");
-                await StopProcess();
-                Status = BackendStatus.ERRORED;
-                return false;
-            }
-            await Task.Delay(1000);
-            try
-            {
-                await InitInternal();
-            }
-            catch (Exception)
-            {
-                // Not up yet, keep waiting.
+                if (proc.HasExited)
+                {
+                    throw new SwarmReadableErrorException($"sd-server exited during startup (code {proc.ExitCode}).\n{TailText()}");
+                }
+                if (Environment.TickCount64 > deadline)
+                {
+                    throw new SwarmReadableErrorException($"Timed out after {Settings.StartupTimeoutSeconds}s waiting for sd-server to load the model.\n{TailText()}");
+                }
+                await Task.Delay(1000, interrupt);
             }
         }
-        return Status == BackendStatus.RUNNING;
+        catch (Exception)
+        {
+            StopProcess();
+            throw;
+        }
+        finally
+        {
+            if (Status == BackendStatus.LOADING)
+            {
+                Status = BackendStatus.RUNNING;
+            }
+        }
     }
 
-    /// <summary>Builds the sd-server argument list (passed via ProcessStartInfo.ArgumentList, which handles all
-    /// escaping, so paths/values with spaces or quotes are safe and cannot inject extra flags).</summary>
-    public List<string> BuildArgs(string modelPath, int port)
+    /// <summary>Builds the sd-server argument list.</summary>
+    public List<string> BuildArgs(ModelFiles files, int port)
     {
-        List<string> args = ["-m", modelPath];
+        List<string> args = [.. files.Args()];
         if (!string.IsNullOrWhiteSpace(Settings.Device))
         {
-            args.Add("--backend");
-            args.Add(Settings.Device.Trim());
+            args.AddRange(["--backend", Settings.Device.Trim()]);
         }
         if (Settings.OffloadToCpu) { args.Add("--offload-to-cpu"); }
         if (Settings.VaeTiling) { args.Add("--vae-tiling"); }
         if (Settings.UseMmap) { args.Add("--mmap"); }
         if (Settings.FlashAttention) { args.Add("--diffusion-fa"); }
-        if (Settings.Threads > 0) { args.Add("--threads"); args.Add($"{Settings.Threads}"); }
-        args.Add("--listen-ip");
-        args.Add("127.0.0.1");
-        args.Add("--listen-port");
-        args.Add($"{port}");
-        args.Add("-v");
+        if (Settings.Threads > 0) { args.AddRange(["--threads", $"{Settings.Threads}"]); }
+        if (Program.T2IModelSets["LoRA"].FolderPaths.FirstOrDefault() is string loraDir)
+        {
+            args.AddRange(["--lora-model-dir", loraDir]);
+        }
+        if (SDCppBackendExtension.UpscalerDir is string upscalerDir)
+        {
+            args.AddRange(["--hires-upscalers-dir", upscalerDir]);
+        }
+        args.AddRange(["--listen-ip", "127.0.0.1", "--listen-port", $"{port}", "-v"]);
         string extra = Settings.ExtraArgs?.Trim();
         if (!string.IsNullOrEmpty(extra))
         {
-            // Advanced escape-hatch field: split on whitespace into individual arguments.
+            // Escape hatch: split on whitespace into individual arguments.
             args.AddRange(extra.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
         }
         return args;
     }
 
-    /// <summary>Health-checks the server; on success loads sampler/scheduler lists and flips status to RUNNING.</summary>
-    public async Task InitInternal()
+    /// <summary>True once the server answers; also adds any new sampler and scheduler names it reports.</summary>
+    public async Task<bool> IsServing()
     {
-        if (Port == 0)
-        {
-            return;
-        }
-        JArray samplers = await SendGet<JArray>("samplers");
-        SDCppBackendExtension.LoadSamplerList([.. samplers.Select(o => (string)o["name"]).Where(n => n is not null)]);
         try
         {
-            JArray schedulers = await SendGet<JArray>("schedulers");
-            SDCppBackendExtension.LoadSchedulerList([.. schedulers.Select(o => (string)o["name"]).Where(n => n is not null)]);
+            JObject caps = await SendGet<JObject>("capabilities");
+            SDCppBackendExtension.AddNames(ref SDCppBackendExtension.Samplers, caps["samplers"]?.Select(s => (string)s) ?? []);
+            SDCppBackendExtension.AddNames(ref SDCppBackendExtension.Schedulers, caps["schedulers"]?.Select(s => (string)s) ?? []);
+            return true;
         }
         catch (Exception)
         {
-            // Schedulers endpoint is optional; ignore if missing.
+            return false;
         }
-        Status = BackendStatus.RUNNING;
     }
 
     public override async Task<Image[]> Generate(T2IParamInput user_input)
     {
-        if (RunningProcess is null || RunningProcess.HasExited)
+        return await Run(user_input, null);
+    }
+
+    public override async Task GenerateLive(T2IParamInput user_input, string batchId, Action<object> takeOutput)
+    {
+        Image[] images = await Run(user_input, progress =>
         {
-            throw new SwarmReadableErrorException("The stable-diffusion.cpp backend has no running sd-server (no model loaded yet). Select a model so the backend can start one.");
+            progress["batch_index"] = batchId;
+            progress["request_id"] = $"{user_input.UserRequestId}";
+            takeOutput(progress);
+        });
+        foreach (Image image in images)
+        {
+            takeOutput(image);
         }
-        user_input.ProcessPromptEmbeds(x => x.BeforeLast('.'));
-        JObject toSend = new()
+    }
+
+    /// <summary>Submits a generation job and polls it, reporting previews, until it finishes.</summary>
+    public async Task<Image[]> Run(T2IParamInput input, Action<JObject> onProgress)
+    {
+        await EnsureLoaded(input.Get(T2IParamTypes.Model), input);
+        input.ProcessPromptEmbeds(x => x.BeforeLast('.'));
+        bool hires = Refining(input, out _);
+        int batch = input.Get(T2IParamTypes.BatchSize, 1);
+        JObject submitted = await SendPost<JObject>("img_gen", BuildRequest(input, onProgress is not null));
+        string jobId = (string)submitted["id"] ?? throw new SwarmReadableErrorException($"sd-server rejected the request: {submitted}");
+        long deadline = Environment.TickCount64 + Math.Max(1, Settings.GenerationTimeoutMinutes) * 60_000L;
+        int lastStep = -1, pollFailures = 0;
+        try
         {
-            ["prompt"] = user_input.Get(T2IParamTypes.Prompt),
-            ["negative_prompt"] = user_input.Get(T2IParamTypes.NegativePrompt),
-            ["seed"] = user_input.Get(T2IParamTypes.Seed),
-            ["steps"] = user_input.Get(T2IParamTypes.Steps),
-            ["width"] = user_input.GetImageWidth(),
-            ["height"] = user_input.GetImageHeight(),
-            ["batch_size"] = user_input.Get(T2IParamTypes.BatchSize, 1),
-            ["cfg_scale"] = user_input.Get(T2IParamTypes.CFGScale)
-        };
-        string sampler = user_input.Get(SDCppBackendExtension.SamplerParam);
+            while (true)
+            {
+                await Task.Delay(250);
+                if (input.InterruptToken.IsCancellationRequested)
+                {
+                    await CancelJob(jobId);
+                    return [];
+                }
+                if (Environment.TickCount64 > deadline)
+                {
+                    throw new SwarmReadableErrorException($"Generation timed out after {Settings.GenerationTimeoutMinutes} minutes.");
+                }
+                JObject job;
+                try
+                {
+                    job = await SendGet<JObject>($"jobs/{jobId}");
+                    pollFailures = 0;
+                }
+                catch (Exception)
+                {
+                    await Task.Delay(500);
+                    if (RunningProcess is not { HasExited: false })
+                    {
+                        throw new SwarmReadableErrorException($"sd-server stopped during generation.\n{TailText()}");
+                    }
+                    if (++pollFailures > 2)
+                    {
+                        throw;
+                    }
+                    continue;
+                }
+                switch ((string)job["status"])
+                {
+                    case "completed":
+                        return [.. job["result"]["images"].Select(i => ImageFile.FromBase64((string)i["b64_json"], MediaType.ImagePng) as Image)];
+                    case "failed":
+                        throw new SwarmReadableErrorException($"sd-server failed: {job["error"]?["message"]}");
+                    case "cancelled":
+                        return [];
+                    case "queued" or "generating":
+                        break;
+                    default:
+                        throw new SwarmReadableErrorException($"sd-server reported an unknown job status: {job["status"]}");
+                }
+                if (onProgress is not null && job["preview"] is JObject preview && (int)preview["step"] != lastStep)
+                {
+                    lastStep = (int)preview["step"];
+                    double current = lastStep / Math.Max(1.0, (double)preview["total_steps"]);
+                    double passes = batch * (hires ? 2 : 1);
+                    onProgress(new JObject()
+                    {
+                        ["preview"] = $"data:image/png;base64,{(string)preview["b64_json"]}",
+                        ["overall_percent"] = (((int)preview["pass"] - 1) + current) / passes,
+                        ["current_percent"] = current
+                    });
+                }
+            }
+        }
+        catch (Exception)
+        {
+            await CancelJob(jobId);
+            throw;
+        }
+    }
+
+    /// <summary>Asks sd-server to cancel a job and waits briefly for it to stop, so the next request does not queue behind it. Never throws.</summary>
+    public async Task CancelJob(string jobId)
+    {
+        try
+        {
+            await SendPost<JObject>($"jobs/{jobId}/cancel", [], 10);
+            long end = Environment.TickCount64 + 15_000;
+            while (Environment.TickCount64 < end)
+            {
+                await Task.Delay(250);
+                if ((string)(await SendGet<JObject>($"jobs/{jobId}"))["status"] is "cancelled" or "completed" or "failed")
+                {
+                    return;
+                }
+            }
+            Logs.Warning($"[SDcpp-{BackendData.ID}] Job {jobId} did not stop within 15s of cancelling.");
+        }
+        catch (Exception ex)
+        {
+            Logs.Warning($"[SDcpp-{BackendData.ID}] Could not cancel job {jobId}: {ex.Message}");
+        }
+    }
+
+    /// <summary>Builds the body for sd-server's native img_gen API.</summary>
+    public static JObject BuildRequest(T2IParamInput input, bool wantPreviews)
+    {
+        int width = input.GetImageWidth(), height = input.GetImageHeight(), steps = input.Get(T2IParamTypes.Steps);
+        JObject guidance = new() { ["txt_cfg"] = input.Get(T2IParamTypes.CFGScale) };
+        if (input.TryGet(T2IParamTypes.FluxGuidanceScale, out double distilled))
+        {
+            guidance["distilled_guidance"] = distilled;
+        }
+        JObject sampleParams = new() { ["sample_steps"] = steps, ["guidance"] = guidance };
+        string sampler = input.Get(SDCppBackendExtension.SamplerParam);
         if (!string.IsNullOrWhiteSpace(sampler))
         {
-            toSend["sampler_name"] = sampler;
+            sampleParams["sample_method"] = sampler;
         }
-        string scheduler = user_input.Get(SDCppBackendExtension.SchedulerParam);
+        string scheduler = input.Get(SDCppBackendExtension.SchedulerParam);
         if (!string.IsNullOrWhiteSpace(scheduler))
         {
-            toSend["scheduler"] = scheduler;
+            sampleParams["scheduler"] = scheduler;
         }
-        // SwarmUI's CLIP Stop At Layer counts layers from the end (negative, eg -1, -2); sd-server's clip_skip
-        // uses the A1111 positive convention (1 = skip none, 2 = skip one), so negate.
-        if (user_input.TryGet(T2IParamTypes.ClipStopAtLayer, out int clipStop))
+        JObject request = new()
         {
-            toSend["clip_skip"] = -clipStop;
-        }
-        string route = "txt2img";
-        if (user_input.TryGet(T2IParamTypes.InitImage, out Image initImg))
+            ["prompt"] = input.Get(T2IParamTypes.Prompt),
+            ["negative_prompt"] = input.Get(T2IParamTypes.NegativePrompt),
+            ["seed"] = input.Get(T2IParamTypes.Seed),
+            ["width"] = width,
+            ["height"] = height,
+            ["batch_count"] = input.Get(T2IParamTypes.BatchSize, 1),
+            ["sample_params"] = sampleParams,
+            ["preview"] = wantPreviews && !input.Get(T2IParamTypes.NoPreviews) ? "proj" : "none"
+        };
+        // SwarmUI's CLIP Stop At Layer counts back from the end (-1, -2); sd.cpp's clip_skip counts layers skipped (1, 2).
+        if (input.TryGet(T2IParamTypes.ClipStopAtLayer, out int clipStop))
         {
-            route = "img2img";
-            toSend["init_images"] = new JArray(initImg.AsBase64);
-            toSend["denoising_strength"] = user_input.Get(T2IParamTypes.InitImageCreativity);
+            request["clip_skip"] = -clipStop;
         }
-        // ponytail: LoRA not wired yet. The A1111 endpoint's LoRA handling in sd-server differs from A1111
-        // (structured 'lora' array, not '<lora:..>' prompt syntax). Add when LoRA support is needed.
-        JObject result = await SendPost<JObject>(route, toSend, Math.Max(1, Settings.GenerationTimeoutMinutes) * 60);
-        JToken images = result["images"];
-        if (images is null)
+        if (input.TryGet(T2IParamTypes.InitImage, out Image initImage))
         {
-            throw new SwarmReadableErrorException($"sd-server returned no images. Response: {result}");
+            request["init_image"] = initImage.Resize(width, height).AsBase64;
+            request["strength"] = input.Get(T2IParamTypes.InitImageCreativity);
         }
-        return [.. images.Select(i => ImageFile.FromBase64((string)i, MediaType.ImagePng) as Image)];
+        if (input.TryGet(T2IParamTypes.Loras, out List<string> loras))
+        {
+            List<string> weights = input.Get(T2IParamTypes.LoraWeights);
+            request["lora"] = new JArray(loras.Select((name, i) => new JObject()
+            {
+                ["path"] = LoraPath(name),
+                ["multiplier"] = double.Parse(weights[i], CultureInfo.InvariantCulture)
+            }));
+        }
+        if (Refining(input, out double control))
+        {
+            // Like ComfyUI's refiner: the second pass runs the last 'control' fraction of the steps.
+            int refinerSteps = input.Get(T2IParamTypes.RefinerSteps, steps);
+            request["hires"] = new JObject()
+            {
+                ["enabled"] = true,
+                ["upscaler"] = HiresUpscaler(input.Get(ComfyUIBackendExtension.RefinerUpscaleMethod, "pixel-lanczos")),
+                ["scale"] = input.Get(T2IParamTypes.RefinerUpscale, 1.0),
+                ["steps"] = Math.Max(1, refinerSteps - (int)Math.Round(refinerSteps * (1 - control))),
+                ["denoising_strength"] = control
+            };
+        }
+        return request;
     }
 
     public async Task<JType> SendGet<JType>(string url, int timeoutSeconds = 15) where JType : class
     {
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(timeoutSeconds));
-        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.GetAsync($"{Address}/sdapi/v1/{url}", cts.Token));
+        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.GetAsync($"{Address}/sdcpp/v1/{url}", cts.Token));
     }
 
-    public async Task<JType> SendPost<JType>(string url, JObject payload, int timeoutSeconds) where JType : class
+    public async Task<JType> SendPost<JType>(string url, JObject payload, int timeoutSeconds = 60) where JType : class
     {
         using CancellationTokenSource cts = new(TimeSpan.FromSeconds(timeoutSeconds));
-        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.PostAsync($"{Address}/sdapi/v1/{url}", Utilities.JSONContent(payload), cts.Token));
+        return await NetworkBackendUtils.Parse<JType>(await Utilities.UtilWebClient.PostAsync($"{Address}/sdcpp/v1/{url}", Utilities.JSONContent(payload), cts.Token));
     }
 
-    /// <summary>Pumps stdout/stderr to logs and marks the backend ERRORED if the process dies unexpectedly.</summary>
-    public void MonitorProcess(Process proc)
+    public void LogLine(string line)
     {
-        string id = $"SDcpp-{BackendData.ID}";
-        void Pump(StreamReader reader, bool isErr)
+        if (line is null)
         {
+            return;
+        }
+        LogTail.Enqueue(line);
+        while (LogTail.Count > 40)
+        {
+            LogTail.TryDequeue(out _);
+        }
+        string low = line.ToLowerFast();
+        string text = $"[SDcpp-{BackendData.ID}] {line}";
+        if (low.Contains("error") || low.Contains("failed") || low.Contains("exception"))
+        {
+            Logs.Warning(text);
+        }
+        else
+        {
+            Logs.Debug(text);
+        }
+    }
+
+    public string TailText() => $"Last server output:\n{LogTail.TakeLast(8).JoinString("\n")}";
+
+    /// <summary>Forgets the server if it dies on its own, so the next request relaunches it instead of failing. Disposes the process once it exits.</summary>
+    public void WatchForCrash(Process proc)
+    {
+        _ = Task.Run(async () =>
+        {
+            await proc.WaitForExitAsync();
+            await LoadLock.WaitAsync();
             try
             {
-                string line;
-                while ((line = reader.ReadLine()) is not null)
+                if (ReferenceEquals(RunningProcess, proc))
                 {
-                    string low = line.ToLowerFast();
-                    if (low.Contains("error") || low.Contains("failed") || low.Contains("exception"))
-                    {
-                        Logs.Warning($"[{id}/{(isErr ? "ERR" : "OUT")}] {line}");
-                    }
-                    else
-                    {
-                        Logs.Debug($"[{id}/{(isErr ? "ERR" : "OUT")}] {line}");
-                    }
+                    Logs.Error($"[SDcpp-{BackendData.ID}] sd-server exited unexpectedly (code {proc.ExitCode}).\n{TailText()}");
+                    RunningProcess = null;
+                    LoadedFiles = null;
+                    CurrentModelName = null;
                 }
             }
-            catch (Exception)
+            finally
             {
-                // Stream closed on process exit.
+                LoadLock.Release();
             }
-        }
-        new Thread(() => Pump(new StreamReader(proc.StandardOutput.BaseStream, Encoding.UTF8), false)) { IsBackground = true, Name = $"{id}_out" }.Start();
-        new Thread(() =>
-        {
-            Pump(new StreamReader(proc.StandardError.BaseStream, Encoding.UTF8), true);
-            // Runs after the process's stderr closes (i.e. it exited). Only react if this is still the active
-            // process and we didn't intentionally stop it.
-            if (ReferenceEquals(RunningProcess, proc) && !ExpectedExit && (Status == BackendStatus.RUNNING || Status == BackendStatus.LOADING))
-            {
-                int code = proc.HasExited ? proc.ExitCode : -1;
-                Logs.Error($"[{id}] sd-server exited unexpectedly (exit code {code}). Set LogLevel to Debug to see server output.");
-                Status = BackendStatus.ERRORED;
-            }
-        })
-        { IsBackground = true, Name = $"{id}_err" }.Start();
+            proc.Dispose();
+        });
     }
 
-    /// <summary>Kills the running sd-server process, if any, marking the exit as expected.</summary>
-    public async Task StopProcess()
+    /// <summary>Kills the running sd-server process, if any.</summary>
+    public void StopProcess()
     {
         Process proc = RunningProcess;
         RunningProcess = null;
-        CurrentModelPath = null;
-        int oldPort = Port;
+        LoadedFiles = null;
         Port = 0;
         if (proc is null || proc.HasExited)
         {
             return;
         }
-        ExpectedExit = true;
         try
         {
-            Logs.Info($"[SDcpp] Stopping sd-server (port {oldPort}) process #{proc.Id}...");
+            Logs.Info($"[SDcpp] Stopping sd-server process #{proc.Id}...");
             Utilities.KillProcess(proc, 10);
         }
         catch (Exception ex)
         {
             Logs.Error($"[SDcpp] Error stopping sd-server process: {ex.ReadableString()}");
         }
-        await Task.Delay(250); // Give the OS a moment to release the port.
     }
 }
