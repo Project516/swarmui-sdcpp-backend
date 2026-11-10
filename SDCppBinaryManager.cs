@@ -236,16 +236,17 @@ public static class SDCppBinaryManager
         }
         if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
         {
+            // Upstream bumps the Ubuntu version in Linux asset names, so don't match on it.
             switch (variant)
             {
                 case "vulkan":
-                    AddIfFound(found, FindAssetEndingWith(assets, "-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip"));
+                    AddIfFound(found, FindAssetContaining(assets, "-bin-Linux-", "-x86_64-vulkan.zip"));
                     break;
                 case "cpu":
-                    AddIfFound(found, FindAssetEndingWith(assets, "-bin-Linux-Ubuntu-24.04-x86_64.zip"));
+                    AddIfFound(found, FindAssetContaining(assets, "-bin-Linux-", "-x86_64.zip"));
                     break;
                 case "rocm":
-                    AddIfFound(found, FindHighestVersionAsset(assets, "-bin-Linux-Ubuntu-24.04-x86_64-rocm-", ".zip"));
+                    AddIfFound(found, FindHighestVersionAsset(assets, "-x86_64-rocm-", ".zip"));
                     break;
                 case "cuda":
                     throw new Exception("Linux CUDA prebuilts are not published upstream for stable-diffusion.cpp. Use the 'vulkan' variant, or build sd-server from source with CUDA support and set BinaryPathOverride.");
