@@ -123,8 +123,9 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
 
     // 'controlnet' is advertised because SwarmUI's frontend sends "ControlNet Model = (None)" on every request.
     // Real ControlNet use is refused in IsValidForThisBackend. 'refiners' and 'comfyui' are needed for the
-    // Refine / Upscale group, whose "Refiner Upscale Method" parameter is flagged 'comfyui'.
-    public override IEnumerable<string> SupportedFeatures => ["sdcpp", "controlnet", "refiners", "comfyui"];
+    // Refine / Upscale group, whose "Refiner Upscale Method" parameter is flagged 'comfyui'. sd-server loads GGUF
+    // natively; without 'gguf' the frontend offers to install ComfyUI's GGUF node instead.
+    public override IEnumerable<string> SupportedFeatures => ["sdcpp", "controlnet", "refiners", "comfyui", "gguf"];
 
     /// <summary>sd-server's batch_count limit.</summary>
     public const int MaxBatchSize = 8;
