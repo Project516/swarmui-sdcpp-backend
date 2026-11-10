@@ -309,19 +309,7 @@ public class SDCppSelfStartBackend : AbstractT2IBackend
         {
             start.ArgumentList.Add(arg);
         }
-        // Stability Matrix and similar launchers pollute the environment with Python paths that can confuse a native binary.
-        PythonLaunchHelper.CleanEnvironmentOfPythonMess(start, "(SDcpp launch) ");
-        // sd-server's shared libraries (libggml-*, libstable-diffusion, ...) sit alongside the binary.
-        if (OperatingSystem.IsWindows())
-        {
-            start.Environment.TryGetValue("PATH", out string existingPath);
-            start.Environment["PATH"] = $"{BinDir};{existingPath}";
-        }
-        else
-        {
-            start.Environment.TryGetValue("LD_LIBRARY_PATH", out string existingLibPath);
-            start.Environment["LD_LIBRARY_PATH"] = $"{BinDir}:{existingLibPath}";
-        }
+        SDCppBinaryManager.PrepareEnvironment(start, BinDir);
         Status = BackendStatus.LOADING;
         try
         {

@@ -1,6 +1,8 @@
 using Newtonsoft.Json.Linq;
+using SwarmUI.Builtin_ComfyUIBackend;
 using SwarmUI.Core;
 using SwarmUI.Utils;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Net.Http;
@@ -174,6 +176,7 @@ public static class SDCppBinaryManager
                 throw new Exception($"'{ServerBinaryName}' missing after extraction - the release asset layout may have changed upstream.");
             }
             SetExecutable(staging);
+            await CheckBinaryRuns(staging);
             // Marker written last, inside staging, so it only becomes visible once the whole install succeeded.
             File.WriteAllText(Path.Combine(staging, MarkerFileName), tag);
             // Swap into place. The old cache is untouched until this point.
@@ -332,6 +335,59 @@ public static class SDCppBinaryManager
             }
         }
         return best;
+    }
+
+    /// <summary>Sets up the environment sd-server runs in: strips launcher Python paths that can confuse a native
+    /// binary, and puts <paramref name="binDir"/> on the library search path since sd-server's shared libraries sit beside it.</summary>
+    public static void PrepareEnvironment(ProcessStartInfo start, string binDir)
+    {
+        PythonLaunchHelper.CleanEnvironmentOfPythonMess(start, "(SDcpp launch) ");
+        if (OperatingSystem.IsWindows())
+        {
+            start.Environment.TryGetValue("PATH", out string existingPath);
+            start.Environment["PATH"] = $"{binDir};{existingPath}";
+        }
+        else
+        {
+            start.Environment.TryGetValue("LD_LIBRARY_PATH", out string existingLibPath);
+            start.Environment["LD_LIBRARY_PATH"] = $"{binDir}:{existingLibPath}";
+        }
+    }
+
+    /// <summary>Runs the new sd-server before it replaces the cache, so a build this host can't load (eg one
+    /// linked against a newer glibc) is rejected and the existing cached binary stays in use.</summary>
+    static async Task CheckBinaryRuns(string dir)
+    {
+        ProcessStartInfo start = new()
+        {
+            FileName = Path.Combine(dir, ServerBinaryName),
+            WorkingDirectory = dir,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        start.ArgumentList.Add("--help");
+        PrepareEnvironment(start, dir);
+        using Process process = Process.Start(start);
+        Task<string> stdout = process.StandardOutput.ReadToEndAsync();
+        Task<string> stderr = process.StandardError.ReadToEndAsync();
+        using CancellationTokenSource timeout = new(TimeSpan.FromSeconds(30));
+        try
+        {
+            await process.WaitForExitAsync(timeout.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            try { process.Kill(true); }
+            catch { /* already exited */ }
+            throw new Exception($"The downloaded '{ServerBinaryName}' did not finish '--help' within 30 seconds.");
+        }
+        await stdout;
+        string error = (await stderr).Trim();
+        if (process.ExitCode != 0)
+        {
+            throw new Exception($"The downloaded '{ServerBinaryName}' does not run on this system (exit code {process.ExitCode}): {error}");
+        }
     }
 
     static void SetExecutable(string cacheDir)
